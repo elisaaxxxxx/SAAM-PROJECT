@@ -1,5 +1,7 @@
 """
 STEP 1: CLEANING DATA 
+Taking just the monthly returns data, removing all rows with all NaN values, replacing values less than 0.5 with NaN, forward filling the NaN values, 
+and then removing any columns that have more than 50% zero returns in a rolling window of 120 months.
 """
 
 import pandas as pd
