@@ -55,26 +55,22 @@ returns_df = pd.DataFrame(
 returns_df = pd.concat([monthly_returns[["NAME", "ISIN"]], returns_df], axis=1)
 
 # ── 7. FLAG STALE SECURITIES ──────────────────────────────────────────────────
-# For each year-end, over the trailing 120 months:
-# if proportion of zero returns > 50%, exclude from that year's investment set.
-# This is applied dynamically per rebalancing year in the main portfolio loop.
+# For each year-end:
+# If proportion of zero returns > 50%, exclude from that year's investment set.
+# This is applied dynamically for every investment year.
 # Here we pre-compute the full zero-return indicator matrix for convenience.
 
 ret_only = returns_df[price_cols]
 is_zero = (ret_only == 0).astype(float)
 
-# Rolling 120-month proportion of zero returns (applied per-year in the loop)
-# Shape: (n_firms, n_months)
-# We'll use this inside the portfolio construction loop below.
-
-# ── 8. BUILD PER-YEAR INVESTABLE UNIVERSE ─────────────────────────────────────
+# ── 8. BUILD YEARLY FEASIBLE INVESTMENT SET ─────────────────────────────────────
 # At each year-end Y, a firm is investable if:
 #   (a) its last RI at end-Y is not NaN (i.e., not already delisted/missing)
 #   (b) it has at least 36 valid return observations in the trailing 120 months
 #   (c) zero-return proportion in trailing 120 months ≤ 50%
 #   (d) [Part II] it has carbon data available — to be merged later
 
-# Map column names to positions (assuming monthly columns labelled as dates)
+# Map column names to positions for easy indexing
 date_cols = list(price_cols)
 
 year_ends = {y: f"{y}-12" for y in range(2013, 2025)}  # adjust to your col format
