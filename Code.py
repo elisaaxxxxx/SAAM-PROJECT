@@ -68,35 +68,53 @@ is_zero = (ret_only == 0).astype(float)
 #   (c) zero-return proportion in trailing 120 months ≤ 50%
 #   (d) [Part II] it has carbon data available — to be merged later
 
-# Map column names to positions for easy indexing
-date_cols = list(price_cols)
+# Edit date columns to actual datetime structure
+price_cols_dt = pd.to_datetime(price_cols)
 
-year_ends = {y: f"{y}-12" for y in range(2013, 2025)}  # adjust to your col format
+# Find the December column for each year
+year_ends = {}
+for year in range(2013, 2025):
+    dec_mask = (price_cols_dt.month == 12) & (price_cols_dt.year == year)
+    matches = price_cols[dec_mask]
+    if len(matches) > 0:
+        year_ends[year] = matches[0]
+    else:
+        print(f"Warning: no December column found for {year}")
 
-investable_universe = {}  # dict: year → list of valid ISINs
+print(year_ends)
+date_cols = list(price_cols)  # add this line before the loop
+
+investable_universe = {}
 
 for year, end_col in year_ends.items():
-    if end_col not in date_cols:
-        continue
     end_idx = date_cols.index(end_col)
     window_start = max(0, end_idx - 119)
     window = ret_only.iloc[:, window_start:end_idx + 1]
 
-    # (a) Price must exist at year-end in RI
     ri_at_year_end = monthly_returns[end_col]
     has_price = ri_at_year_end.notna() & (ri_at_year_end > 0)
 
-    # (b) Minimum 36 valid return observations in window
     valid_obs = window.notna().sum(axis=1)
     enough_history = valid_obs >= 36
 
-    # (c) Stale price filter
     zero_proportion = (window == 0).sum(axis=1) / window.shape[1]
     not_stale = zero_proportion <= 0.5
 
     mask = has_price & enough_history & not_stale
     investable_universe[year] = monthly_returns.loc[mask, "ISIN"].tolist()
     print(f"{year}: {mask.sum()} investable firms")
+    
+# Check — how many valid return observations does Firmenich have?
+firmenich_row = returns_df[returns_df["NAME"].str.contains("Firmenich", case=False, na=False)]
+
+if firmenich_row.empty:
+    print("Not found — check name spelling")
+else:
+    ret_only_row = firmenich_row[price_cols]
+    valid_count = ret_only_row.notna().sum(axis=1).values[0]
+    print(f"Valid return observations: {valid_count}")
+    print(f"First valid return: {ret_only_row.columns[ret_only_row.notna().any()][0]}")
+    print(price_cols[-5:])
 
 # ── 9. SAVE OUTPUTS ───────────────────────────────────────────────────────────
 returns_df.to_csv("data/clean_returns.csv", index=False)
