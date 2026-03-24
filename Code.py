@@ -164,3 +164,126 @@ with open("data/investable_universe.json", "w") as f:
     json.dump(investable_universe, f, indent=2)
 
 print("\nAll outputs saved.")
+
+"""
+STEP 2: CLEANING MARKET VALUE DATA 
+Cleaning monthly and yearly MV per project guidelines
+"""
+
+import pandas as pd
+import numpy as np
+
+df_mv_m = pd.read_excel("data/Filtered_MV_T_USD_M_2025.xlsx", sheet_name=0)
+df_mv_y = pd.read_excel("data/Filtered_MV_T_USD_Y_2025.xlsx", sheet_name=0)
+
+mv_cols_m = df_mv_m.columns[2:]
+mv_cols_m_dt = pd.to_datetime(mv_cols_m)
+year_cols_mv = [c for c in df_mv_y.columns if isinstance(c, int)]
+
+# ── Clean monthly MV ──────────────────────────────────────────────────────────
+# Zeros mean not yet listed or delisted — replace with NaN first
+df_mv_m_clean = df_mv_m.copy()
+df_mv_m_clean[mv_cols_m] = df_mv_m_clean[mv_cols_m].replace(0, np.nan)
+
+# Mark delistings (trailing NaNs → 0)
+def mark_delisting(row):
+    last_valid = row.last_valid_index()
+    if last_valid is None:
+        return row
+    last_pos = row.index.get_loc(last_valid)
+    if last_pos < len(row) - 1:
+        row.iloc[last_pos + 1:] = 0
+    return row
+
+df_mv_m_clean[mv_cols_m] = df_mv_m_clean[mv_cols_m].apply(mark_delisting, axis=1)
+
+# Forward-fill mid-sample gaps (NaNs between valid values only)
+df_mv_m_clean[mv_cols_m] = df_mv_m_clean[mv_cols_m].ffill(axis=1)
+
+# ── Clean yearly MV ───────────────────────────────────────────────────────────
+df_mv_y_clean = df_mv_y.copy()
+df_mv_y_clean[year_cols_mv] = df_mv_y_clean[year_cols_mv].replace(0, np.nan)
+df_mv_y_clean[year_cols_mv] = df_mv_y_clean[year_cols_mv].apply(mark_delisting, axis=1)
+df_mv_y_clean[year_cols_mv] = df_mv_y_clean[year_cols_mv].ffill(axis=1)
+
+# ── Sanity checks ─────────────────────────────────────────────────────────────
+print(f"Monthly MV zeros remaining:  {(df_mv_m_clean[mv_cols_m] == 0).sum().sum()}")
+print(f"Monthly MV NaNs remaining:   {df_mv_m_clean[mv_cols_m].isna().sum().sum()}")
+print(f"Yearly MV zeros remaining:   {(df_mv_y_clean[year_cols_mv] == 0).sum().sum()}")
+print(f"Yearly MV NaNs remaining:    {df_mv_y_clean[year_cols_mv].isna().sum().sum()}")
+
+# ── Save ──────────────────────────────────────────────────────────────────────
+df_mv_m_clean.to_csv("data/clean_mv_monthly.csv", index=False)
+df_mv_y_clean.to_csv("data/clean_mv_yearly.csv", index=False)
+print("\nMV files saved.")
+
+"""
+STEP 3: CLEANING CARBON AND REVENUE DATA 
+Cleaning CO2 and Revenue per project guidelines
+"""
+
+import pandas as pd
+import numpy as np
+
+df_co2 = pd.read_excel("data/Filtered_CO2_SCOPE_1_Y_2025.xlsx")
+df_rev = pd.read_excel("data/Filtered_REV_Y_2025.xlsx")
+
+year_cols_co2 = [c for c in df_co2.columns if isinstance(c, int)]
+year_cols_rev = [c for c in df_rev.columns if isinstance(c, int)]
+
+# ── Force numeric (handles scientific notation in revenue) ────────────────────
+df_co2[year_cols_co2] = df_co2[year_cols_co2].apply(pd.to_numeric, errors='coerce')
+df_rev[year_cols_rev] = df_rev[year_cols_rev].apply(pd.to_numeric, errors='coerce')
+
+# ── CO2: replace zeros with NaN (not yet reporting) ──────────────────────────
+df_co2[year_cols_co2] = df_co2[year_cols_co2].replace(0, np.nan)
+
+# ── Revenue: replace zeros and negatives with NaN ────────────────────────────
+df_rev[year_cols_rev] = df_rev[year_cols_rev].replace(0, np.nan)
+df_rev[year_cols_rev] = df_rev[year_cols_rev].where(df_rev[year_cols_rev] > 0)
+
+# ── Forward-fill mid-sample and trailing gaps (per spec) ─────────────────────
+# Leading NaNs are preserved — can't invest until data appears
+# Note: no delisting logic needed for carbon/revenue — these are reported
+# annually and a trailing gap just means latest data not yet available,
+# not that the firm ceased to exist
+df_co2[year_cols_co2] = df_co2[year_cols_co2].ffill(axis=1)
+df_rev[year_cols_rev] = df_rev[year_cols_rev].ffill(axis=1)
+
+# ── Compute carbon intensity ──────────────────────────────────────────────────
+# CI = CO2 (tonnes) / Revenue (thousands USD / 1000) = CO2 / (Rev / 1000)
+# i.e. tonnes CO2 per million USD revenue
+# Both dataframes are aligned by row (same 634 firms, same order) — verify:
+assert (df_co2["ISIN"].values == df_rev["ISIN"].values).all(), \
+    "ISIN order mismatch between CO2 and Revenue files"
+
+ci_values = np.full((len(df_co2), len(year_cols_co2)), np.nan)
+for i, year in enumerate(year_cols_co2):
+    if year in year_cols_rev:
+        co2 = df_co2[year].values.astype(float)
+        rev = df_rev[year].values.astype(float) / 1000  # convert to millions
+        with np.errstate(divide='ignore', invalid='ignore'):
+            ci_values[:, i] = np.where(rev > 0, co2 / rev, np.nan)
+
+df_ci = pd.DataFrame(ci_values, columns=year_cols_co2)
+df_ci = pd.concat([df_co2[["NAME", "ISIN"]].reset_index(drop=True), df_ci], axis=1)
+
+# ── Sanity checks ─────────────────────────────────────────────────────────────
+print("=== After cleaning ===")
+print(f"CO2 NaNs:     {df_co2[year_cols_co2].isna().sum().sum()}")
+print(f"Revenue NaNs: {df_rev[year_cols_rev].isna().sum().sum()}")
+print(f"CI NaNs:      {df_ci[year_cols_co2].isna().sum().sum()}")
+print(f"CI negatives: {(df_ci[year_cols_co2] < 0).sum().sum()}")
+
+# Check how many firms have carbon data available by year
+print("\n=== Firms with valid CI per year ===")
+for year in year_cols_co2:
+    valid = df_ci[year].notna().sum()
+    print(f"  {year}: {valid} firms")
+
+# ── Save ──────────────────────────────────────────────────────────────────────
+df_co2.to_csv("data/clean_co2.csv", index=False)
+df_rev.to_csv("data/clean_revenue.csv", index=False)
+df_ci.to_csv("data/clean_carbon_intensity.csv", index=False)
+
+print("\nCarbon files saved.")
