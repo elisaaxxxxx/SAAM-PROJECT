@@ -1,5 +1,5 @@
 """
-STEP 1: CLEANING DATA 
+STEP 1: CLEANING RETURNS DATA 
 Cleaning monthly and yearly RI per project guidelines
 """
 
@@ -68,6 +68,8 @@ def clean_price_series(df, value_cols, min_price=0.5):
 df_ri_m_clean = clean_price_series(df_ri_m, price_cols_m)
 df_ri_y_clean = clean_price_series(df_ri_y, year_cols_ri)
 print("Price series cleaned.")
+print(f"Zeros remaining in monthly RI: {(df_ri_m_clean[price_cols_m] == 0).sum().sum()}")
+print(f"Zeros remaining in yearly RI:  {(df_ri_y_clean[year_cols_ri] == 0).sum().sum()}")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 5. COMPUTE RETURNS
@@ -128,7 +130,7 @@ for year, end_col in year_ends.items():
     if ri_y_at_year_end is not None:
         has_yearly_price = ri_y_at_year_end.notna() & (ri_y_at_year_end > 0)
     else:
-        has_yearly_price = pd.Series(True, index=df_ri_y_clean.index)
+        has_yearly_price = pd.Series(True, index=df_ri_m_clean.index)
 
     # Filter 3: sufficient return history (≥36 months in trailing 120m window)
     valid_obs = window.notna().sum(axis=1)
