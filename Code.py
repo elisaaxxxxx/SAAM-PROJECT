@@ -456,3 +456,191 @@ print(f"Files created:")
 print(f"  data/investable_universe.json      — per-year ISIN lists")
 print(f"  data/exclusion_log.csv             — filter breakdown per year")
 print(f"  data/investable_universe_flat.csv  — flat list for inspection")
+
+"""
+STEP 5: EXCLUSION AUDIT
+Produces a clear summary of which firms were excluded at each cleaning step
+and a final master file showing inclusion/exclusion status per firm per year.
+"""
+import pandas as pd
+import numpy as np
+import json
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 1. LOAD ALL CLEANED FILES
+# ═══════════════════════════════════════════════════════════════════════════════
+returns_m_df = pd.read_csv("data/cleaned data/clean_returns_monthly.csv")
+prices_m_df  = pd.read_csv("data/cleaned data/clean_prices_monthly.csv")
+prices_y_df  = pd.read_csv("data/cleaned data/clean_prices_yearly.csv")
+mv_y_df      = pd.read_csv("data/cleaned data/clean_mv_yearly.csv")
+ci_df        = pd.read_csv("data/cleaned data/clean_carbon_intensity.csv")
+
+with open("data/investable_set.json") as f:
+    investable_set = json.load(f)
+
+# Master firm list
+firms = returns_m_df[["NAME", "ISIN"]].copy()
+all_isins = firms["ISIN"].tolist()
+
+# Column identification
+price_cols_m    = [c for c in prices_m_df.columns  if c not in ["NAME", "ISIN"]]
+ret_cols_m      = [c for c in returns_m_df.columns if c not in ["NAME", "ISIN"]]
+year_cols_py    = [int(c) for c in prices_y_df.columns if c not in ["NAME", "ISIN"]]
+year_cols_mv    = [int(c) for c in mv_y_df.columns    if c not in ["NAME", "ISIN"]]
+year_cols_ci    = [int(c) for c in ci_df.columns      if c not in ["NAME", "ISIN"]]
+price_cols_m_dt = pd.to_datetime(price_cols_m)
+ret_matrix      = returns_m_df[ret_cols_m].values.astype(float)
+
+# Map rebalancing years to December columns
+year_ends = {}
+for year in range(2013, 2025):
+    dec_mask = (price_cols_m_dt.month == 12) & (price_cols_m_dt.year == year)
+    matches = [c for c, m in zip(price_cols_m, dec_mask) if m]
+    if matches:
+        year_ends[year] = matches[0]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 2. COMPUTE FILTER STATUS FOR EVERY FIRM × YEAR
+# ═══════════════════════════════════════════════════════════════════════════════
+records = []
+
+for year, end_col in year_ends.items():
+
+    end_idx      = price_cols_m.index(end_col)
+    window_start = max(0, end_idx - 119)
+    window       = ret_matrix[:, window_start:end_idx + 1]
+
+    # Each filter as boolean array (True = passes)
+    mp_at_end  = prices_m_df[end_col].values.astype(float)
+    f1 = (mp_at_end > 0) & (~np.isnan(mp_at_end))
+
+    yp_at_end  = prices_y_df[str(year)].values.astype(float) \
+                 if year in year_cols_py else np.ones(len(all_isins), dtype=bool)
+    f2 = (yp_at_end > 0) & (~np.isnan(yp_at_end))
+
+    valid_obs  = (~np.isnan(window)).sum(axis=1)
+    f3 = valid_obs >= 36
+
+    zero_prop  = (window == 0).sum(axis=1) / window.shape[1]
+    f4 = zero_prop <= 0.5
+
+    mv_at_end  = mv_y_df[str(year)].values.astype(float) \
+                 if year in year_cols_mv else np.ones(len(all_isins), dtype=bool)
+    f5 = (mv_at_end > 0) & (~np.isnan(mv_at_end))
+
+    ci_at_end  = ci_df[str(year)].values.astype(float) \
+                 if year in year_cols_ci else np.zeros(len(all_isins), dtype=bool)
+    f6 = (~np.isnan(ci_at_end)) & (ci_at_end > 0)
+
+    final = f1 & f2 & f3 & f4 & f5 & f6
+
+    for i, isin in enumerate(all_isins):
+        # Determine exclusion reason (first failing filter wins)
+        if final[i]:
+            reason = "included"
+        elif not f1[i]:
+            reason = "no monthly price"
+        elif not f2[i]:
+            reason = "no yearly price"
+        elif not f3[i]:
+            reason = "insufficient history"
+        elif not f4[i]:
+            reason = "stale prices"
+        elif not f5[i]:
+            reason = "no market value"
+        elif not f6[i]:
+            reason = "no carbon data"
+        else:
+            reason = "unknown"
+
+        records.append({
+            "year":       year,
+            "ISIN":       isin,
+            "NAME":       firms.loc[i, "NAME"],
+            "f1_monthly_price":  bool(f1[i]),
+            "f2_yearly_price":   bool(f2[i]),
+            "f3_history":        bool(f3[i]),
+            "f4_not_stale":      bool(f4[i]),
+            "f5_mv":             bool(f5[i]),
+            "f6_carbon":         bool(f6[i]),
+            "investable":        bool(final[i]),
+            "exclusion_reason":  reason
+        })
+
+audit_df = pd.DataFrame(records)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 3. SUMMARY: FIRMS NEVER INVESTABLE IN ANY YEAR
+# ═══════════════════════════════════════════════════════════════════════════════
+ever_investable = audit_df.groupby("ISIN")["investable"].any()
+never_investable_isins = ever_investable[~ever_investable].index.tolist()
+never_investable_df = firms[firms["ISIN"].isin(never_investable_isins)].copy()
+
+# Why was each never-investable firm excluded (most common reason)
+never_reasons = audit_df[audit_df["ISIN"].isin(never_investable_isins)] \
+    .groupby("ISIN")["exclusion_reason"].agg(lambda x: x.value_counts().index[0])
+never_investable_df["primary_reason"] = never_investable_df["ISIN"].map(never_reasons)
+
+print(f"=== Firms NEVER investable in any year: {len(never_investable_df)} ===")
+print(never_investable_df.to_string())
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 4. SUMMARY: FIRMS INVESTABLE IN SOME BUT NOT ALL YEARS
+# ═══════════════════════════════════════════════════════════════════════════════
+years_investable = audit_df.groupby("ISIN")["investable"].sum().astype(int)
+sometimes_df = firms[
+    firms["ISIN"].isin(years_investable[
+        (years_investable > 0) & (years_investable < 11)
+    ].index)
+].copy()
+sometimes_df["years_investable"] = sometimes_df["ISIN"].map(years_investable)
+
+print(f"\n=== Firms investable in SOME years only: {len(sometimes_df)} ===")
+print(sometimes_df.sort_values("years_investable").to_string())
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 5. PIVOT: ONE ROW PER FIRM, ONE COLUMN PER YEAR
+# ═══════════════════════════════════════════════════════════════════════════════
+pivot_investable = audit_df.pivot(
+    index="ISIN", columns="year", values="investable"
+).astype(int)  # 1 = investable, 0 = excluded
+
+pivot_reason = audit_df.pivot(
+    index="ISIN", columns="year", values="exclusion_reason"
+)
+
+# Merge with firm names
+pivot_investable = firms.set_index("ISIN")[["NAME"]].join(pivot_investable)
+pivot_reason     = firms.set_index("ISIN")[["NAME"]].join(pivot_reason)
+
+# Add summary columns
+pivot_investable["total_years_investable"] = \
+    pivot_investable[[y for y in range(2013, 2025)]].sum(axis=1)
+pivot_investable["ever_investable"] = \
+    pivot_investable["total_years_investable"] > 0
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 6. SAVE OUTPUTS
+# ═══════════════════════════════════════════════════════════════════════════════
+# Full audit log (long format — one row per firm per year)
+audit_df.to_csv("data/exclusion_audit_long.csv", index=False)
+
+# Pivot: 1/0 investable per firm per year
+pivot_investable.to_csv("data/exclusion_audit_pivot.csv")
+
+# Pivot: exclusion reason per firm per year
+pivot_reason.to_csv("data/exclusion_audit_reasons.csv")
+
+# Never investable firms
+never_investable_df.to_csv("data/firms_never_investable.csv", index=False)
+
+print(f"\n=== Per-year investable counts ===")
+for year in range(2013, 2025):
+    n = audit_df[audit_df["year"] == year]["investable"].sum()
+    print(f"  {year}: {n} firms")
+
+print("\nFiles saved:")
+print("  data/exclusion_audit_long.csv      — full filter status per firm per year")
+print("  data/exclusion_audit_pivot.csv     — 1/0 investable matrix")
+print("  data/exclusion_audit_reasons.csv   — exclusion reason matrix")
+print("  data/firms_never_investable.csv    — firms excluded in every year")
