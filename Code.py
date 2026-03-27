@@ -23,7 +23,7 @@ print(f"  Yearly RI:  {df_ri_y.shape}")
 price_cols_m = df_ri_m.columns[2:]
 price_cols_m_dt = pd.to_datetime(price_cols_m)
 
-# Yearly RI: date columns are integers after NAME, ISIN
+# Yearly RI: define date columns are integers after NAME, ISIN
 year_cols_ri = [c for c in df_ri_y.columns if isinstance(c, int)]
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -31,8 +31,7 @@ year_cols_ri = [c for c in df_ri_y.columns if isinstance(c, int)]
 # ═══════════════════════════════════════════════════════════════════════════════
 def clean_price_series(df, value_cols, min_price=0.5):
     """
-    Cleans a price dataframe according to project spec rules:
-      - Nullify prices below min_price
+      - Ignore RI values below min_price
       - Mark delistings (trailing NaNs → 0)
       - Forward-fill mid-sample gaps only
     """
@@ -47,7 +46,7 @@ def clean_price_series(df, value_cols, min_price=0.5):
     def mark_delisting(row):
         last_valid = row.last_valid_index()
         if last_valid is None:
-            return row  # entirely missing — leave as NaN, exclude from universe
+            return row  # entirely missing — leave as NaN, exclude from set
         last_pos = row.index.get_loc(last_valid)
         if last_pos < len(row) - 1:
             row.iloc[last_pos + 1:] = 0
@@ -114,7 +113,7 @@ for year in range(2013, 2025):
         print(f"Warning: no December column found for {year}")
 
 date_cols_m = list(price_cols_m)
-investable_universe = {}
+investable_set = {}
 
 for year, end_col in year_ends.items():
     end_idx = date_cols_m.index(end_col)
@@ -148,7 +147,7 @@ for year, end_col in year_ends.items():
     base_mask = has_monthly_price & enough_history & not_stale
     final_mask = base_mask & monthly_isins.isin(yearly_valid_isins)
 
-    investable_universe[year] = df_ri_m_clean.loc[final_mask, "ISIN"].tolist()
+    investable_set[year] = df_ri_m_clean.loc[final_mask, "ISIN"].tolist()
     print(f"{year}: {final_mask.sum()} investable firms")
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -160,10 +159,11 @@ df_ri_m_clean.to_csv("data/clean_prices_monthly.csv", index=False)
 df_ri_y_clean.to_csv("data/clean_prices_yearly.csv", index=False)
 
 import json
-with open("data/investable_universe.json", "w") as f:
-    json.dump(investable_universe, f, indent=2)
+with open("data/investable_set.json", "w") as f:
+    json.dump(investable_set, f, indent=2)
 
 print("\nAll outputs saved.")
+
 
 """
 STEP 2: CLEANING MARKET VALUE DATA 
@@ -173,8 +173,8 @@ Cleaning monthly and yearly MV per project guidelines
 import pandas as pd
 import numpy as np
 
-df_mv_m = pd.read_excel("data/Filtered_MV_T_USD_M_2025.xlsx", sheet_name=0)
-df_mv_y = pd.read_excel("data/Filtered_MV_T_USD_Y_2025.xlsx", sheet_name=0)
+df_mv_m = pd.read_excel("data/Filtered_MV_T_USD_M_2025.xlsx")
+df_mv_y = pd.read_excel("data/Filtered_MV_T_USD_Y_2025.xlsx")
 
 mv_cols_m = df_mv_m.columns[2:]
 mv_cols_m_dt = pd.to_datetime(mv_cols_m)
@@ -289,9 +289,81 @@ df_ci.to_csv("data/clean_carbon_intensity.csv", index=False)
 print("\nCarbon files saved.")
 
 """
-STEP 4: BUILD FINAL INVESTABLE UNIVERSE
-Combines all cleaned data sources and applies all exclusion criteria
-to produce the final per-year investable universe.
+STEP 3: CLEANING CARBON AND REVENUE DATA 
+Cleaning CO2 and Revenue per project guidelines
+"""
+
+import pandas as pd
+import numpy as np
+
+df_co2 = pd.read_excel("data/Filtered_CO2_SCOPE_1_Y_2025.xlsx")
+df_rev = pd.read_excel("data/Filtered_REV_Y_2025.xlsx")
+
+year_cols_co2 = [c for c in df_co2.columns if isinstance(c, int)]
+year_cols_rev = [c for c in df_rev.columns if isinstance(c, int)]
+
+# ── Force numeric (handles scientific notation in revenue) ────────────────────
+df_co2[year_cols_co2] = df_co2[year_cols_co2].apply(pd.to_numeric, errors='coerce')
+df_rev[year_cols_rev] = df_rev[year_cols_rev].apply(pd.to_numeric, errors='coerce')
+
+# ── CO2: replace zeros with NaN (not yet reporting) ──────────────────────────
+df_co2[year_cols_co2] = df_co2[year_cols_co2].replace(0, np.nan)
+
+# ── Revenue: replace zeros and negatives with NaN ────────────────────────────
+df_rev[year_cols_rev] = df_rev[year_cols_rev].replace(0, np.nan)
+df_rev[year_cols_rev] = df_rev[year_cols_rev].where(df_rev[year_cols_rev] > 0)
+
+# ── Forward-fill mid-sample and trailing gaps (per spec) ─────────────────────
+# Leading NaNs are preserved — can't invest until data appears
+# Note: no delisting logic needed for carbon/revenue — these are reported
+# annually and a trailing gap just means latest data not yet available,
+# not that the firm ceased to exist
+df_co2[year_cols_co2] = df_co2[year_cols_co2].ffill(axis=1)
+df_rev[year_cols_rev] = df_rev[year_cols_rev].ffill(axis=1)
+
+# ── Compute carbon intensity ──────────────────────────────────────────────────
+# CI = CO2 (tonnes) / Revenue (thousands USD / 1000) = CO2 / (Rev / 1000)
+# i.e. tonnes CO2 per million USD revenue
+# Both dataframes are aligned by row (same 634 firms, same order) — verify:
+assert (df_co2["ISIN"].values == df_rev["ISIN"].values).all(), \
+    "ISIN order mismatch between CO2 and Revenue files"
+
+ci_values = np.full((len(df_co2), len(year_cols_co2)), np.nan)
+for i, year in enumerate(year_cols_co2):
+    if year in year_cols_rev:
+        co2 = df_co2[year].values.astype(float)
+        rev = df_rev[year].values.astype(float) / 1000  # convert to millions
+        with np.errstate(divide='ignore', invalid='ignore'):
+            ci_values[:, i] = np.where(rev > 0, co2 / rev, np.nan)
+
+df_ci = pd.DataFrame(ci_values, columns=year_cols_co2)
+df_ci = pd.concat([df_co2[["NAME", "ISIN"]].reset_index(drop=True), df_ci], axis=1)
+
+# ── Sanity checks ─────────────────────────────────────────────────────────────
+print("=== After cleaning ===")
+print(f"CO2 NaNs:     {df_co2[year_cols_co2].isna().sum().sum()}")
+print(f"Revenue NaNs: {df_rev[year_cols_rev].isna().sum().sum()}")
+print(f"CI NaNs:      {df_ci[year_cols_co2].isna().sum().sum()}")
+print(f"CI negatives: {(df_ci[year_cols_co2] < 0).sum().sum()}")
+
+# Check how many firms have carbon data available by year
+print("\n=== Firms with valid CI per year ===")
+for year in year_cols_co2:
+    valid = df_ci[year].notna().sum()
+    print(f"  {year}: {valid} firms")
+
+# ── Save ──────────────────────────────────────────────────────────────────────
+df_co2.to_csv("data/clean_co2.csv", index=False)
+df_rev.to_csv("data/clean_revenue.csv", index=False)
+df_ci.to_csv("data/clean_carbon_intensity.csv", index=False)
+
+print("\nCarbon files saved.")
+
+"""
+STEP 4: BUILD FINAL INVESTABLE UNIVERSE 2004-2024
+Applies all exclusion criteria rolling from 2004 onwards.
+- 2004-2012: estimation window years (no carbon filter required)
+- 2013-2024: portfolio years (all filters including carbon)
 """
 import pandas as pd
 import numpy as np
@@ -300,11 +372,11 @@ import json
 # ═══════════════════════════════════════════════════════════════════════════════
 # 1. LOAD ALL CLEANED FILES
 # ═══════════════════════════════════════════════════════════════════════════════
-returns_m_df  = pd.read_csv("data/cleaned data/clean_returns_monthly.csv")
-prices_m_df   = pd.read_csv("data/cleaned data/clean_prices_monthly.csv")
-prices_y_df   = pd.read_csv("data/cleaned data/clean_prices_yearly.csv")
-mv_y_df       = pd.read_csv("data/cleaned data/clean_mv_yearly.csv")
-ci_df         = pd.read_csv("data/cleaned data/clean_carbon_intensity.csv")
+returns_m_df = pd.read_csv("Data/Cleaned data/clean_returns_monthly.csv")
+prices_m_df  = pd.read_excel("Data/Cleaned data/clean_prices_monthly.xlsx")
+prices_y_df  = pd.read_csv("Data/Cleaned data/clean_prices_yearly.csv")
+mv_y_df      = pd.read_csv("Data/Cleaned data/clean_mv_yearly.csv")
+ci_df        = pd.read_csv("Data/Cleaned data/clean_carbon_intensity.csv")
 
 print("Files loaded.")
 print(f"  Monthly returns: {returns_m_df.shape}")
@@ -316,146 +388,192 @@ print(f"  Carbon intensity:{ci_df.shape}")
 # ═══════════════════════════════════════════════════════════════════════════════
 # 2. IDENTIFY COLUMNS
 # ═══════════════════════════════════════════════════════════════════════════════
-# Monthly: timestamp columns after NAME, ISIN
-ret_cols_m   = [c for c in returns_m_df.columns  if c not in ["NAME", "ISIN"]]
-price_cols_m = [c for c in prices_m_df.columns   if c not in ["NAME", "ISIN"]]
+ret_cols_m   = [c for c in returns_m_df.columns if c not in ["NAME", "ISIN"]]
+price_cols_m = [c for c in prices_m_df.columns  if c not in ["NAME", "ISIN"]]
+ret_cols_m_dt = pd.to_datetime(ret_cols_m)
+year_cols_py = [int(c) for c in prices_y_df.columns if c not in ["NAME", "ISIN"]]
+year_cols_mv = [int(c) for c in mv_y_df.columns     if c not in ["NAME", "ISIN"]]
+year_cols_ci = [int(c) for c in ci_df.columns       if c not in ["NAME", "ISIN"]]
 
-# Yearly: integer columns after NAME, ISIN
-year_cols_py = [c for c in prices_y_df.columns   if c not in ["NAME", "ISIN"]]
-year_cols_mv = [c for c in mv_y_df.columns       if c not in ["NAME", "ISIN"]]
-year_cols_ci = [c for c in ci_df.columns         if c not in ["NAME", "ISIN"]]
-
-# Convert yearly cols to int for consistent comparison
-year_cols_py = [int(c) for c in year_cols_py]
-year_cols_mv = [int(c) for c in year_cols_mv]
-year_cols_ci = [int(c) for c in year_cols_ci]
-
-# Convert monthly columns to datetime for December lookup
 price_cols_m_dt = pd.to_datetime(price_cols_m)
 
+all_isins  = returns_m_df["ISIN"].dropna().tolist()
+ret_matrix = returns_m_df[ret_cols_m].values.astype(float)
+
 # ═══════════════════════════════════════════════════════════════════════════════
-# 3. MAP REBALANCING YEARS TO DECEMBER MONTHLY COLUMNS
+# 3. MAP ALL YEARS 2004-2024 TO DECEMBER MONTHLY COLUMN
 # ═══════════════════════════════════════════════════════════════════════════════
 year_ends = {}
-for year in range(2013, 2025):
+for year in range(2004, 2025):
     dec_mask = (price_cols_m_dt.month == 12) & (price_cols_m_dt.year == year)
-    matches = [c for c, m in zip(price_cols_m, dec_mask) if m]
+    matches  = [c for c, m in zip(price_cols_m, dec_mask) if m]
     if matches:
         year_ends[year] = matches[0]
     else:
         print(f"Warning: no December column found for {year}")
 
-print(f"\nRebalancing years mapped: {list(year_ends.keys())}")
+print(f"Years mapped: {list(year_ends.keys())}")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 4. BUILD UNIVERSE YEAR BY YEAR
+# 4. ROLLING UNIVERSE — ALL YEARS 2004-2024
 # ═══════════════════════════════════════════════════════════════════════════════
-all_isins = returns_m_df["ISIN"].dropna().tolist()
-ret_matrix = returns_m_df[ret_cols_m].values.astype(float)
-
-investable_universe = {}
+full_universe = {}
 exclusion_log = {}
 
 for year, end_col in year_ends.items():
 
-    # ── Monthly window (trailing 120 months) ─────────────────────────────────
-    end_idx = price_cols_m.index(end_col)
+    is_portfolio_year = (year >= 2013)
+
+    end_idx      = price_cols_m.index(end_col)
     window_start = max(0, end_idx - 119)
-    window = ret_matrix[:, window_start:end_idx + 1]
+    window       = ret_matrix[:, window_start:end_idx + 1]
 
-    # ── Filter 1: valid monthly price at year-end ─────────────────────────────
+    # F1: valid monthly price at year-end
     mp_at_end = prices_m_df[end_col].values.astype(float)
-    f1_monthly_price = (mp_at_end > 0) & (~np.isnan(mp_at_end))
+    f1 = (mp_at_end > 0) & (~np.isnan(mp_at_end))
 
-    # ── Filter 2: valid yearly RI at year-end ─────────────────────────────────
+    # F2: valid yearly RI at year-end
     if year in year_cols_py:
         yp_at_end = prices_y_df[str(year)].values.astype(float)
-        f2_yearly_price = (yp_at_end > 0) & (~np.isnan(yp_at_end))
+        f2 = (yp_at_end > 0) & (~np.isnan(yp_at_end))
     else:
-        f2_yearly_price = np.ones(len(all_isins), dtype=bool)
+        f2 = np.ones(len(all_isins), dtype=bool)
 
-    # ── Filter 3: sufficient return history (≥36 months in window) ───────────
+    # F3: sufficient history (>=36 valid monthly returns in window)
     valid_obs = (~np.isnan(window)).sum(axis=1)
-    f3_history = valid_obs >= 36
+    f3 = valid_obs >= 36
 
-    # ── Filter 4: stale price filter (≤50% zero returns in window) ───────────
+    # F4: not stale (<=50% zero returns in window)
     zero_prop = (window == 0).sum(axis=1) / window.shape[1]
-    f4_not_stale = zero_prop <= 0.5
+    f4 = zero_prop <= 0.5
 
-    # ── Filter 5: valid MV at year-end ────────────────────────────────────────
+    # F5: valid MV at year-end
     if year in year_cols_mv:
         mv_at_end = mv_y_df[str(year)].values.astype(float)
-        f5_mv = (mv_at_end > 0) & (~np.isnan(mv_at_end))
+        f5 = (mv_at_end > 0) & (~np.isnan(mv_at_end))
     else:
-        f5_mv = np.ones(len(all_isins), dtype=bool)
+        f5 = np.ones(len(all_isins), dtype=bool)
 
-    # ── Filter 6: valid carbon intensity at year-end ──────────────────────────
-    if year in year_cols_ci:
+    # F6: valid carbon intensity — portfolio years only
+    if is_portfolio_year and year in year_cols_ci:
         ci_at_end = ci_df[str(year)].values.astype(float)
-        f6_carbon = (~np.isnan(ci_at_end)) & (ci_at_end > 0)
+        f6 = (~np.isnan(ci_at_end)) & (ci_at_end > 0)
     else:
-        f6_carbon = np.zeros(len(all_isins), dtype=bool)
+        f6 = np.ones(len(all_isins), dtype=bool)
 
-    # ── Combine all filters ───────────────────────────────────────────────────
-    final_mask = f1_monthly_price & f2_yearly_price & f3_history & \
-                 f4_not_stale & f5_mv & f6_carbon
+    final_mask = f1 & f2 & f3 & f4 & f5 & f6
 
-    investable_isins = [isin for isin, m in zip(all_isins, final_mask) if m]
-    investable_universe[year] = investable_isins
+    full_universe[year] = [
+        isin for isin, m in zip(all_isins, final_mask) if m
+    ]
 
-    # ── Exclusion log ─────────────────────────────────────────────────────────
-    n = len(all_isins)
     exclusion_log[year] = {
-        "start":               n,
-        "fail_monthly_price":  int((~f1_monthly_price).sum()),
-        "fail_yearly_price":   int((~f2_yearly_price).sum()),
-        "fail_history":        int((~f3_history).sum()),
-        "fail_stale":          int((~f4_not_stale).sum()),
-        "fail_mv":             int((~f5_mv).sum()),
-        "fail_carbon":         int((~f6_carbon).sum()),
-        "final":               int(final_mask.sum())
+        "period":             "portfolio" if is_portfolio_year else "estimation",
+        "start":              len(all_isins),
+        "fail_monthly_price": int((~f1).sum()),
+        "fail_yearly_price":  int((~f2).sum()),
+        "fail_history":       int((~f3).sum()),
+        "fail_stale":         int((~f4).sum()),
+        "fail_mv":            int((~f5).sum()),
+        "fail_carbon":        int((~f6).sum()) if is_portfolio_year else 0,
+        "final":              int(final_mask.sum())
     }
 
-    print(f"{year}: {final_mask.sum():3d} investable firms  "
-          f"(price:{(~f1_monthly_price).sum()} "
-          f"yprice:{(~f2_yearly_price).sum()} "
-          f"hist:{(~f3_history).sum()} "
-          f"stale:{(~f4_not_stale).sum()} "
-          f"mv:{(~f5_mv).sum()} "
-          f"carbon:{(~f6_carbon).sum()} excluded)")
+    carbon_str = f" carbon:{(~f6).sum()}" if is_portfolio_year else ""
+    period_str = "PRT" if is_portfolio_year else "EST"
+    print(f"{year} [{period_str}]: {final_mask.sum():3d} firms  "
+          f"(price:{(~f1).sum()} "
+          f"yprice:{(~f2).sum()} "
+          f"hist:{(~f3).sum()} "
+          f"stale:{(~f4).sum()} "
+          f"mv:{(~f5).sum()}"
+          f"{carbon_str} excluded)")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 5. SAVE OUTPUTS
+# 5. BUILD FULL RETURNS FILE WITH FLAGS
 # ═══════════════════════════════════════════════════════════════════════════════
-# Save universe as JSON
-with open("data/investable_universe.json", "w") as f:
-    json.dump(investable_universe, f, indent=2)
+records = []
 
-# Save exclusion log as CSV for report
-exclusion_df = pd.DataFrame(exclusion_log).T
-exclusion_df.index.name = "year"
-exclusion_df.to_csv("data/exclusion_log.csv")
+for year, end_col in year_ends.items():
+    inv_isins = full_universe[year]
 
-# Save a flat CSV of all investable firms per year (useful for inspection)
+    if year < 2013:
+        target_year = year
+        period      = "in_sample"
+    else:
+        target_year = year + 1
+        period      = "out_of_sample"
+
+    month_mask = ret_cols_m_dt.year == target_year
+    month_cols = [c for c, m in zip(ret_cols_m, month_mask) if m]
+    if not month_cols:
+        continue
+
+    year_long = returns_m_df[["NAME", "ISIN"] + month_cols].melt(
+        id_vars=["NAME", "ISIN"],
+        var_name="date",
+        value_name="return"
+    )
+    year_long["universe_year"]  = year
+    year_long["target_year"]    = target_year
+    year_long["period"]         = period
+    year_long["investable"]     = year_long["ISIN"].isin(inv_isins)
+    year_long["data_available"] = year_long["return"].notna()
+    year_long["used"]           = (
+        year_long["investable"] & year_long["data_available"]
+    )
+    records.append(year_long)
+
+full_df = pd.concat(records, ignore_index=True)
+full_df["date"] = pd.to_datetime(full_df["date"])
+full_df = full_df.sort_values(
+    ["universe_year", "ISIN", "date"]
+).reset_index(drop=True)
+
+print(f"\nFull returns dataset: {full_df.shape}")
+print(f"\nBreakdown by period and investable status:")
+print(full_df.groupby(["period", "investable", "data_available"])
+      .size().to_string())
+
+# ── Investable-only returns ───────────────────────────────────────────────────
+inv_only_df = full_df[full_df["used"] == True].copy()
+print(f"\nInvestable-only returns: {inv_only_df.shape}")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 6. SAVE ALL OUTPUTS
+# ═══════════════════════════════════════════════════════════════════════════════
+# Flat universe per year
+firm_names = returns_m_df.set_index("ISIN")["NAME"]
 rows = []
-for year, isins in investable_universe.items():
-    firm_names = returns_m_df.set_index("ISIN")["NAME"]
+for year, isins in full_universe.items():
     for isin in isins:
         rows.append({
-            "year": year,
-            "ISIN": isin,
-            "NAME": firm_names.get(isin, "")
+            "year":   year,
+            "ISIN":   isin,
+            "NAME":   firm_names.get(isin, ""),
+            "period": "portfolio" if year >= 2013 else "estimation"
         })
-universe_flat_df = pd.DataFrame(rows)
-universe_flat_df.to_csv("data/investable_universe_flat.csv", index=False)
+flat_df = pd.DataFrame(rows)
 
-print("\n=== Exclusion log ===")
-print(exclusion_df.to_string())
-print("\nAll outputs saved.")
-print(f"Files created:")
-print(f"  data/investable_universe.json      — per-year ISIN lists")
-print(f"  data/exclusion_log.csv             — filter breakdown per year")
-print(f"  data/investable_universe_flat.csv  — flat list for inspection")
+# Exclusion log dataframe
+exclusion_df = pd.DataFrame(exclusion_log).T
+exclusion_df.index.name = "year"
+
+# Save
+with open("Data/Cleaned data/full_universe.json", "w") as f:
+    json.dump(full_universe, f, indent=2)
+
+exclusion_df.to_csv("Data/Cleaned data/full_exclusion_log.csv")
+flat_df.to_csv("Data/Cleaned data/full_universe_flat.csv", index=False)
+full_df.to_csv("Data/Cleaned data/full_returns_with_flags.csv", index=False)
+inv_only_df.to_csv("Data/Cleaned data/investable_returns_long.csv", index=False)
+
+print("\nFiles saved:")
+print("  Data/Cleaned data/full_universe.json")
+print("  Data/Cleaned data/full_exclusion_log.csv")
+print("  Data/Cleaned data/full_universe_flat.csv")
+print("  Data/Cleaned data/full_returns_with_flags.csv")
+print("  Data/Cleaned data/investable_returns_long.csv")
 
 """
 STEP 5: EXCLUSION AUDIT
